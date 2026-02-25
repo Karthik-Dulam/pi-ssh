@@ -343,16 +343,19 @@ export default function piSshExtension(pi: ExtensionAPI): void {
 
     try {
       connection = await resolveSshConnection(flag, localCwd);
+      const enabledMessage = `pi-ssh enabled: ${connection.remote}:${connection.remoteCwd}`;
+      console.log(enabledMessage);
       if (ctx.hasUI) {
         ctx.ui.setStatus(
           "pi-ssh",
           ctx.ui.theme.fg("accent", `SSH ${connection.remote}:${connection.remoteCwd}`),
         );
-        ctx.ui.notify(`pi-ssh enabled: ${connection.remote}:${connection.remoteCwd}`, "info");
+        ctx.ui.notify(enabledMessage, "info");
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       connection = null;
+      console.error(`pi-ssh failed to connect: ${message}`);
       if (ctx.hasUI) {
         ctx.ui.setStatus("pi-ssh", undefined);
         ctx.ui.notify(`pi-ssh failed to connect: ${message}`, "error");
