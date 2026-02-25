@@ -120,7 +120,8 @@ ssh user@host 'which cat test mkdir pwd'
 
 ### Slow tool calls
 
-`bash`/`!` commands use one persistent SSH session. `read`/`write`/`edit` still open per-operation SSH calls for now.
+`bash`/`!` and most `read`/`write`/`edit` operations use a shared persistent SSH session.
+Very large writes fall back to one-shot SSH streaming for reliability.
 
 ## Development
 

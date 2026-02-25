@@ -432,24 +432,83 @@ class PersistentRemoteShell {
   }
 }
 
-function createRemoteReadOps(conn: SshConnection): ReadOperations {
+const PERSISTENT_WRITE_MAX_BYTES = 256 * 1024;
+
+function remoteDirname(path: string): string {
+  const slashIndex = path.lastIndexOf("/");
+  if (slashIndex <= 0) return "/";
+  return path.slice(0, slashIndex);
+}
+
+async function execThroughPersistentShell(
+  shell: PersistentRemoteShell,
+  conn: SshConnection,
+  command: string,
+  timeout?: number,
+): Promise<{ exitCode: number | null; output: Buffer }> {
+  const outputChunks: Buffer[] = [];
+  const result = await shell.exec(command, conn.localCwd, {
+    timeout,
+    onData: (data) => {
+      outputChunks.push(data);
+    },
+  });
   return {
-    readFile: (absolutePath) => {
+    exitCode: result.exitCode,
+    output: Buffer.concat(outputChunks),
+  };
+}
+
+function createRemoteReadOps(conn: SshConnection, shell: PersistentRemoteShell | null): ReadOperations {
+  return {
+    readFile: async (absolutePath) => {
       const remotePath = mapLocalPathToRemote(absolutePath, conn);
+
+      if (shell) {
+        const result = await execThroughPersistentShell(shell, conn, `cat -- ${shellQuote(remotePath)}`);
+        if (result.exitCode !== 0) {
+          const stderr = result.output.toString("utf-8").trim();
+          throw new Error(stderr || `SSH command failed with exit code ${result.exitCode}`);
+        }
+        return result.output;
+      }
+
       return sshExec(conn.remote, conn.port, `cat -- ${shellQuote(remotePath)}`);
     },
     access: async (absolutePath) => {
       const remotePath = mapLocalPathToRemote(absolutePath, conn);
+
+      if (shell) {
+        const result = await execThroughPersistentShell(shell, conn, `test -r ${shellQuote(remotePath)}`);
+        if (result.exitCode !== 0) {
+          const stderr = result.output.toString("utf-8").trim();
+          throw new Error(stderr || `SSH command failed with exit code ${result.exitCode}`);
+        }
+        return;
+      }
+
       await sshExec(conn.remote, conn.port, `test -r ${shellQuote(remotePath)}`);
     },
     detectImageMimeType: async (absolutePath) => {
       const remotePath = mapLocalPathToRemote(absolutePath, conn);
       try {
-        const output = await sshExec(
-          conn.remote,
-          conn.port,
-          `file --mime-type -b -- ${shellQuote(remotePath)} 2>/dev/null || true`,
-        );
+        let output: Buffer;
+
+        if (shell) {
+          const result = await execThroughPersistentShell(
+            shell,
+            conn,
+            `file --mime-type -b -- ${shellQuote(remotePath)} 2>/dev/null || true`,
+          );
+          output = result.output;
+        } else {
+          output = await sshExec(
+            conn.remote,
+            conn.port,
+            `file --mime-type -b -- ${shellQuote(remotePath)} 2>/dev/null || true`,
+          );
+        }
+
         const mime = output.toString("utf-8").trim();
         if (["image/jpeg", "image/png", "image/gif", "image/webp"].includes(mime)) {
           return mime;
@@ -462,30 +521,70 @@ function createRemoteReadOps(conn: SshConnection): ReadOperations {
   };
 }
 
-function createRemoteWriteOps(conn: SshConnection): WriteOperations {
+function createRemoteWriteOps(conn: SshConnection, shell: PersistentRemoteShell | null): WriteOperations {
   return {
     mkdir: async (absoluteDir) => {
       const remoteDir = mapLocalPathToRemote(absoluteDir, conn);
+
+      if (shell) {
+        const result = await execThroughPersistentShell(shell, conn, `mkdir -p -- ${shellQuote(remoteDir)}`);
+        if (result.exitCode !== 0) {
+          const stderr = result.output.toString("utf-8").trim();
+          throw new Error(stderr || `SSH command failed with exit code ${result.exitCode}`);
+        }
+        return;
+      }
+
       await sshExec(conn.remote, conn.port, `mkdir -p -- ${shellQuote(remoteDir)}`);
     },
     writeFile: async (absolutePath, content) => {
       const remotePath = mapLocalPathToRemote(absolutePath, conn);
+      const contentBuffer = Buffer.from(content, "utf-8");
+
+      if (shell && contentBuffer.length <= PERSISTENT_WRITE_MAX_BYTES) {
+        const remoteDir = remoteDirname(remotePath);
+        const encodedContent = contentBuffer.toString("base64");
+        const command = [
+          `mkdir -p -- ${shellQuote(remoteDir)}`,
+          `printf '%s' ${shellQuote(encodedContent)} | base64 -d > ${shellQuote(remotePath)}`,
+        ].join(" && ");
+
+        const result = await execThroughPersistentShell(shell, conn, command);
+        if (result.exitCode === 0) {
+          return;
+        }
+      }
+
       await sshExec(conn.remote, conn.port, `cat > ${shellQuote(remotePath)}`, {
-        stdin: Buffer.from(content, "utf-8"),
+        stdin: contentBuffer,
       });
     },
   };
 }
 
-function createRemoteEditOps(conn: SshConnection): EditOperations {
-  const readOps = createRemoteReadOps(conn);
-  const writeOps = createRemoteWriteOps(conn);
+function createRemoteEditOps(conn: SshConnection, shell: PersistentRemoteShell | null): EditOperations {
+  const readOps = createRemoteReadOps(conn, shell);
+  const writeOps = createRemoteWriteOps(conn, shell);
 
   return {
     readFile: readOps.readFile,
     writeFile: writeOps.writeFile,
     access: async (absolutePath) => {
       const remotePath = mapLocalPathToRemote(absolutePath, conn);
+
+      if (shell) {
+        const result = await execThroughPersistentShell(
+          shell,
+          conn,
+          `test -r ${shellQuote(remotePath)} && test -w ${shellQuote(remotePath)}`,
+        );
+        if (result.exitCode !== 0) {
+          const stderr = result.output.toString("utf-8").trim();
+          throw new Error(stderr || `SSH command failed with exit code ${result.exitCode}`);
+        }
+        return;
+      }
+
       await sshExec(conn.remote, conn.port, `test -r ${shellQuote(remotePath)} && test -w ${shellQuote(remotePath)}`);
     },
   };
@@ -572,7 +671,7 @@ export default function piSshExtension(pi: ExtensionAPI): void {
       if (!conn) {
         return localRead.execute(id, params, signal, onUpdate);
       }
-      const tool = createReadTool(localCwd, { operations: createRemoteReadOps(conn) });
+      const tool = createReadTool(localCwd, { operations: createRemoteReadOps(conn, persistentShell) });
       return tool.execute(id, params, signal, onUpdate);
     },
   });
@@ -584,7 +683,7 @@ export default function piSshExtension(pi: ExtensionAPI): void {
       if (!conn) {
         return localWrite.execute(id, params, signal, onUpdate);
       }
-      const tool = createWriteTool(localCwd, { operations: createRemoteWriteOps(conn) });
+      const tool = createWriteTool(localCwd, { operations: createRemoteWriteOps(conn, persistentShell) });
       return tool.execute(id, params, signal, onUpdate);
     },
   });
@@ -596,7 +695,7 @@ export default function piSshExtension(pi: ExtensionAPI): void {
       if (!conn) {
         return localEdit.execute(id, params, signal, onUpdate);
       }
-      const tool = createEditTool(localCwd, { operations: createRemoteEditOps(conn) });
+      const tool = createEditTool(localCwd, { operations: createRemoteEditOps(conn, persistentShell) });
       return tool.execute(id, params, signal, onUpdate);
     },
   });
