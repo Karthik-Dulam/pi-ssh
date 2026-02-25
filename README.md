@@ -25,7 +25,9 @@ This is useful when:
   - `write`
   - `edit`
   - `bash`
+- SSH connection multiplexing (`ControlMaster`/`ControlPersist`) for faster repeated tool calls
 - Persistent remote shell session for bash commands
+  - uses your remote account's configured login shell (for example zsh)
   - environment persists across commands (for example `export TEST=123`)
   - Ctrl-C interrupts the current remote command but keeps the SSH session alive
 - Remote execution for user `!` commands
@@ -37,7 +39,7 @@ This is useful when:
 - SSH client installed locally
 - Passwordless SSH auth recommended (keys/agent)
 - Remote host with:
-  - `bash`
+  - a standard login shell (for example `zsh` or `bash`)
   - `cat`, `test`, `mkdir`, `pwd`
   - optional: `file` (for image mime detection)
 
@@ -93,6 +95,7 @@ SSH user@my-vm:/home/user/chromium/src (port 22)
 ## Notes
 
 - Absolute paths are strongly recommended for the remote path.
+- Paths under local `$HOME` are mapped to remote `$HOME` in SSH mode (for example `~/.config/...`).
 - If `--ssh` is not set, extension falls back to local tool behavior.
 - Current version focuses on core coding tools (`read/write/edit/bash`).
 
@@ -104,7 +107,7 @@ Check:
 
 ```bash
 ssh user@host
-ssh user@host 'bash -lc "pwd"'
+ssh user@host 'pwd'
 ```
 
 ### Commands work locally but not remotely
@@ -112,7 +115,7 @@ ssh user@host 'bash -lc "pwd"'
 Verify remote shell tools exist:
 
 ```bash
-ssh user@host 'bash -lc "which bash cat test mkdir pwd"'
+ssh user@host 'which cat test mkdir pwd'
 ```
 
 ### Slow tool calls

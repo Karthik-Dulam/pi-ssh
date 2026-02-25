@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { homedir } from "node:os";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import {
   createBashTool,
@@ -15,7 +16,9 @@ interface SshConnection {
   remote: string;
   port: number;
   remoteCwd: string;
+  remoteHome: string;
   localCwd: string;
+  localHome: string;
 }
 
 interface SshCaptureOptions {
@@ -25,7 +28,8 @@ interface SshCaptureOptions {
 }
 
 interface RunningCommand {
-  marker: string;
+  startMarker: string;
+  endMarker: string;
   timeout?: number;
   onData: (chunk: Buffer) => void;
   signal?: AbortSignal;
@@ -47,10 +51,56 @@ function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+function parseDelimitedShellOutput(
+  stdoutText: string,
+  startMarker: string,
+  endMarker: string,
+): { output: string; exitCode: number | null } | null {
+  const text = stdoutText.replace(/\r\n/g, "\n");
+
+  const endRegex = new RegExp(`(^|\\n)${escapeRegex(endMarker)}:(-?\\d+)(?=\\n|$)`);
+  const endMatch = endRegex.exec(text);
+  if (!endMatch) {
+    return null;
+  }
+
+  const endLineStart = endMatch.index + endMatch[1].length;
+
+  const startRegex = new RegExp(`(^|\\n)${escapeRegex(startMarker)}(?=\\n|$)`, "g");
+  let startLineEnd = 0;
+  let foundStart = false;
+  while (true) {
+    const startMatch = startRegex.exec(text);
+    if (!startMatch) break;
+
+    const startLineStart = startMatch.index + startMatch[1].length;
+    if (startLineStart >= endLineStart) break;
+
+    foundStart = true;
+    startLineEnd = startLineStart + startMarker.length;
+    if (text[startLineEnd] === "\n") {
+      startLineEnd += 1;
+    }
+  }
+
+  if (!foundStart) {
+    return null;
+  }
+
+  const output = text.slice(startLineEnd, endLineStart);
+  const parsedExitCode = Number(endMatch[2]);
+  const exitCode = Number.isNaN(parsedExitCode) ? null : parsedExitCode;
+  return { output, exitCode };
+}
+
 function mapLocalPathToRemote(path: string, conn: SshConnection): string {
   if (path === conn.localCwd) return conn.remoteCwd;
   if (path.startsWith(`${conn.localCwd}/`)) {
     return `${conn.remoteCwd}${path.slice(conn.localCwd.length)}`;
+  }
+  if (path === conn.localHome) return conn.remoteHome;
+  if (path.startsWith(`${conn.localHome}/`)) {
+    return `${conn.remoteHome}${path.slice(conn.localHome.length)}`;
   }
   return path;
 }
@@ -86,7 +136,26 @@ function parseSshPort(raw: string | undefined): number {
   return parsed;
 }
 
+function buildSshBaseArgs(port: number): string[] {
+  return [
+    "-p",
+    String(port),
+    "-o",
+    "ControlMaster=auto",
+    "-o",
+    "ControlPersist=600",
+    "-o",
+    "ControlPath=/tmp/pi-ssh-%C",
+  ];
+}
+
 function buildResolveRemotePathCommand(remotePath: string): string {
+  if (remotePath === "~") {
+    return 'cd -- "$HOME" && pwd';
+  }
+  if (remotePath.startsWith("~/")) {
+    return `cd -- "$HOME"/${shellQuote(remotePath.slice(2))} && pwd`;
+  }
   return `cd -- ${shellQuote(remotePath)} && pwd`;
 }
 
@@ -97,7 +166,7 @@ async function sshCapture(
   options: SshCaptureOptions = {},
 ): Promise<{ stdout: Buffer; stderr: Buffer; exitCode: number | null; timedOut: boolean }> {
   return new Promise((resolve, reject) => {
-    const child = spawn("ssh", ["-p", String(port), remote, "bash", "-lc", remoteCommand], {
+    const child = spawn("ssh", [...buildSshBaseArgs(port), remote, remoteCommand], {
       stdio: ["pipe", "pipe", "pipe"],
     });
 
@@ -202,21 +271,9 @@ class PersistentRemoteShell {
       return;
     }
 
-    const startup = [
-      `cd -- ${shellQuote(this.connection.remoteCwd)}`,
-      "stty -echo 2>/dev/null || true",
-      "export PS1=''",
-      "export PROMPT_COMMAND=''",
-      "exec bash --noprofile --norc",
-    ].join(" && ");
-
-    const child = spawn(
-      "ssh",
-      ["-p", String(this.connection.port), "-tt", this.connection.remote, "bash", "-lc", startup],
-      {
-        stdio: ["pipe", "pipe", "pipe"],
-      },
-    );
+    const child = spawn("ssh", [...buildSshBaseArgs(this.connection.port), "-tt", this.connection.remote], {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
 
     child.on("error", (error) => {
       if (this.running) {
@@ -237,6 +294,12 @@ class PersistentRemoteShell {
     child.stderr.on("data", (chunk: Buffer) => this.handleStderr(chunk));
 
     this.child = child;
+    this.child.stdin.write(
+      "stty -echo 2>/dev/null || true; unset PROMPT_COMMAND 2>/dev/null || true; PS1=''; PROMPT=''; RPROMPT=''; " +
+        "if [ -n \"${ZSH_VERSION-}\" ]; then precmd_functions=(); preexec_functions=(); chpwd_functions=(); unset zle_bracketed_paste 2>/dev/null || true; fi; " +
+        "if [ -n \"${BASH_VERSION-}\" ]; then bind 'set enable-bracketed-paste off' 2>/dev/null || true; fi\n",
+    );
+    this.child.stdin.write(`cd -- ${shellQuote(this.connection.remoteCwd)}\n`);
   }
 
   private handleStdout(chunk: Buffer): void {
@@ -257,25 +320,17 @@ class PersistentRemoteShell {
     if (!running) return;
 
     const stdoutText = Buffer.concat(running.stdoutChunks).toString("utf-8");
-    const regex = new RegExp(`${escapeRegex(running.marker)}:(-?\\d+)`);
-    const match = regex.exec(stdoutText);
-    if (!match) return;
+    const parsed = parseDelimitedShellOutput(stdoutText, running.startMarker, running.endMarker);
+    if (!parsed) return;
 
-    const markerStart = match.index;
-    const markerEnd = markerStart + match[0].length;
-    const stdoutBefore = stdoutText.slice(0, markerStart);
-    const _trailing = stdoutText.slice(markerEnd);
-
-    const cleanStdout = Buffer.from(stdoutBefore, "utf-8");
+    const cleanStdout = Buffer.from(parsed.output, "utf-8");
     const cleanStderr = Buffer.concat(running.stderrChunks);
     const merged = Buffer.concat([cleanStdout, cleanStderr]);
     if (merged.length > 0) {
       running.onData(merged);
     }
 
-    const parsedExitCode = Number(match[1]);
-    const exitCode = Number.isNaN(parsedExitCode) ? null : parsedExitCode;
-
+    const exitCode = parsed.exitCode;
     const timedOut = running.timedOut;
     const aborted = running.aborted;
     const timeout = running.timeout;
@@ -320,22 +375,26 @@ class PersistentRemoteShell {
       throw new Error("Failed to start persistent SSH shell");
     }
 
-    const marker = `__PI_SSH_DONE_${Date.now()}_${Math.random().toString(16).slice(2)}__`;
+    const unique = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+    const startMarker = `__PI_SSH_BEGIN_${unique}__`;
+    const endMarker = `__PI_SSH_DONE_${unique}__`;
     const remoteCwd = mapLocalPathToRemote(cwd, this.connection);
 
     const wrappedCommand = [
+      `printf '${startMarker}\\n'`,
       `if cd -- ${shellQuote(remoteCwd)}; then`,
       `  { ${command}; }`,
       "  __pi_ec=$?",
       "else",
       "  __pi_ec=$?",
       "fi",
-      `printf '${marker}:%s\\n' \"$__pi_ec\"`,
+      `printf '${endMarker}:%s\\n' \"$__pi_ec\"`,
     ].join("\n");
 
     return new Promise((resolve, reject) => {
       const running: RunningCommand = {
-        marker,
+        startMarker,
+        endMarker,
         timeout: options.timeout,
         onData: options.onData,
         signal: options.signal,
@@ -440,8 +499,17 @@ function createRemoteBashOps(shell: PersistentRemoteShell): BashOperations {
   };
 }
 
-async function resolveSshConnection(rawFlag: string, localCwd: string, port: number): Promise<SshConnection> {
+async function resolveSshConnection(rawFlag: string, localCwd: string, localHome: string, port: number): Promise<SshConnection> {
   const parsed = parseSshFlag(rawFlag);
+
+  const remoteHomeBuffer = await sshExec(parsed.remote, port, 'printf "%s" "$HOME"', {
+    timeoutSeconds: 15,
+  });
+  const remoteHome = remoteHomeBuffer.toString("utf-8").trim();
+
+  if (!remoteHome) {
+    throw new Error("Failed to detect remote HOME");
+  }
 
   if (!parsed.remotePath) {
     const remotePwd = await sshExec(parsed.remote, port, "pwd", { timeoutSeconds: 15 });
@@ -449,7 +517,9 @@ async function resolveSshConnection(rawFlag: string, localCwd: string, port: num
       remote: parsed.remote,
       port,
       remoteCwd: remotePwd.toString("utf-8").trim(),
+      remoteHome,
       localCwd,
+      localHome,
     };
   }
 
@@ -461,7 +531,9 @@ async function resolveSshConnection(rawFlag: string, localCwd: string, port: num
     remote: parsed.remote,
     port,
     remoteCwd: resolvedPath.toString("utf-8").trim(),
+    remoteHome,
     localCwd,
+    localHome,
   };
 }
 
@@ -481,6 +553,7 @@ export default function piSshExtension(pi: ExtensionAPI): void {
   });
 
   const localCwd = process.cwd();
+  const localHome = homedir();
 
   const localRead = createReadTool(localCwd);
   const localWrite = createWriteTool(localCwd);
@@ -547,7 +620,7 @@ export default function piSshExtension(pi: ExtensionAPI): void {
     try {
       const rawPort = (pi.getFlag("p") as string | undefined) ?? (pi.getFlag("ssh-port") as string | undefined);
       const port = parseSshPort(rawPort);
-      connection = await resolveSshConnection(flag, localCwd, port);
+      connection = await resolveSshConnection(flag, localCwd, localHome, port);
       persistentShell = new PersistentRemoteShell(connection);
       const enabledMessage = `pi-ssh enabled: ${connection.remote}:${connection.remoteCwd} (port ${connection.port})`;
       console.log(enabledMessage);
