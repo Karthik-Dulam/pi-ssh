@@ -1,0 +1,38 @@
+{
+  "name": "pi-ssh",
+  "version": "0.1.0",
+  "description": "pi extension for local-model plus remote SSH workspace tool execution",
+  "type": "module",
+  "private": false,
+  "main": "index.ts",
+  "files": [
+    "index.ts",
+    "README.md",
+    "extension-spec.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "pi",
+    "coding-agent",
+    "ssh",
+    "extension"
+  ],
+  "author": "Helmut Januschka",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hjanuschka/pi-ssh.git"
+  },
+  "bugs": {
+    "url": "https://github.com/hjanuschka/pi-ssh/issues"
+  },
+  "homepage": "https://github.com/hjanuschka/pi-ssh#readme",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  }
+}
