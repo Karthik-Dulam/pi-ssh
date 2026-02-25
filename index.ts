@@ -13,6 +13,7 @@ import {
 
 interface SshConnection {
   remote: string;
+  port: number;
   remoteCwd: string;
   localCwd: string;
 }
@@ -76,17 +77,27 @@ function parseSshFlag(raw: string): { remote: string; remotePath?: string } {
   return { remote, remotePath };
 }
 
+function parseSshPort(raw: string | undefined): number {
+  const value = (raw ?? "22").trim();
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
+    throw new Error(`Invalid SSH port: ${value}`);
+  }
+  return parsed;
+}
+
 function buildResolveRemotePathCommand(remotePath: string): string {
   return `cd -- ${shellQuote(remotePath)} && pwd`;
 }
 
 async function sshCapture(
   remote: string,
+  port: number,
   remoteCommand: string,
   options: SshCaptureOptions = {},
 ): Promise<{ stdout: Buffer; stderr: Buffer; exitCode: number | null; timedOut: boolean }> {
   return new Promise((resolve, reject) => {
-    const child = spawn("ssh", [remote, "bash", "-lc", remoteCommand], {
+    const child = spawn("ssh", ["-p", String(port), remote, "bash", "-lc", remoteCommand], {
       stdio: ["pipe", "pipe", "pipe"],
     });
 
@@ -138,8 +149,8 @@ async function sshCapture(
   });
 }
 
-async function sshExec(remote: string, remoteCommand: string, options: SshCaptureOptions = {}): Promise<Buffer> {
-  const result = await sshCapture(remote, remoteCommand, options);
+async function sshExec(remote: string, port: number, remoteCommand: string, options: SshCaptureOptions = {}): Promise<Buffer> {
+  const result = await sshCapture(remote, port, remoteCommand, options);
   if (result.timedOut) {
     throw new Error(`SSH command timed out after ${options.timeoutSeconds ?? 0}s`);
   }
@@ -199,9 +210,13 @@ class PersistentRemoteShell {
       "exec bash --noprofile --norc",
     ].join(" && ");
 
-    const child = spawn("ssh", ["-tt", this.connection.remote, "bash", "-lc", startup], {
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+    const child = spawn(
+      "ssh",
+      ["-p", String(this.connection.port), "-tt", this.connection.remote, "bash", "-lc", startup],
+      {
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    );
 
     child.on("error", (error) => {
       if (this.running) {
@@ -362,17 +377,18 @@ function createRemoteReadOps(conn: SshConnection): ReadOperations {
   return {
     readFile: (absolutePath) => {
       const remotePath = mapLocalPathToRemote(absolutePath, conn);
-      return sshExec(conn.remote, `cat -- ${shellQuote(remotePath)}`);
+      return sshExec(conn.remote, conn.port, `cat -- ${shellQuote(remotePath)}`);
     },
     access: async (absolutePath) => {
       const remotePath = mapLocalPathToRemote(absolutePath, conn);
-      await sshExec(conn.remote, `test -r ${shellQuote(remotePath)}`);
+      await sshExec(conn.remote, conn.port, `test -r ${shellQuote(remotePath)}`);
     },
     detectImageMimeType: async (absolutePath) => {
       const remotePath = mapLocalPathToRemote(absolutePath, conn);
       try {
         const output = await sshExec(
           conn.remote,
+          conn.port,
           `file --mime-type -b -- ${shellQuote(remotePath)} 2>/dev/null || true`,
         );
         const mime = output.toString("utf-8").trim();
@@ -391,11 +407,11 @@ function createRemoteWriteOps(conn: SshConnection): WriteOperations {
   return {
     mkdir: async (absoluteDir) => {
       const remoteDir = mapLocalPathToRemote(absoluteDir, conn);
-      await sshExec(conn.remote, `mkdir -p -- ${shellQuote(remoteDir)}`);
+      await sshExec(conn.remote, conn.port, `mkdir -p -- ${shellQuote(remoteDir)}`);
     },
     writeFile: async (absolutePath, content) => {
       const remotePath = mapLocalPathToRemote(absolutePath, conn);
-      await sshExec(conn.remote, `cat > ${shellQuote(remotePath)}`, {
+      await sshExec(conn.remote, conn.port, `cat > ${shellQuote(remotePath)}`, {
         stdin: Buffer.from(content, "utf-8"),
       });
     },
@@ -411,7 +427,7 @@ function createRemoteEditOps(conn: SshConnection): EditOperations {
     writeFile: writeOps.writeFile,
     access: async (absolutePath) => {
       const remotePath = mapLocalPathToRemote(absolutePath, conn);
-      await sshExec(conn.remote, `test -r ${shellQuote(remotePath)} && test -w ${shellQuote(remotePath)}`);
+      await sshExec(conn.remote, conn.port, `test -r ${shellQuote(remotePath)} && test -w ${shellQuote(remotePath)}`);
     },
   };
 }
@@ -424,24 +440,26 @@ function createRemoteBashOps(shell: PersistentRemoteShell): BashOperations {
   };
 }
 
-async function resolveSshConnection(rawFlag: string, localCwd: string): Promise<SshConnection> {
+async function resolveSshConnection(rawFlag: string, localCwd: string, port: number): Promise<SshConnection> {
   const parsed = parseSshFlag(rawFlag);
 
   if (!parsed.remotePath) {
-    const remotePwd = await sshExec(parsed.remote, "pwd", { timeoutSeconds: 15 });
+    const remotePwd = await sshExec(parsed.remote, port, "pwd", { timeoutSeconds: 15 });
     return {
       remote: parsed.remote,
+      port,
       remoteCwd: remotePwd.toString("utf-8").trim(),
       localCwd,
     };
   }
 
-  const resolvedPath = await sshExec(parsed.remote, buildResolveRemotePathCommand(parsed.remotePath), {
+  const resolvedPath = await sshExec(parsed.remote, port, buildResolveRemotePathCommand(parsed.remotePath), {
     timeoutSeconds: 15,
   });
 
   return {
     remote: parsed.remote,
+    port,
     remoteCwd: resolvedPath.toString("utf-8").trim(),
     localCwd,
   };
@@ -450,6 +468,15 @@ async function resolveSshConnection(rawFlag: string, localCwd: string): Promise<
 export default function piSshExtension(pi: ExtensionAPI): void {
   pi.registerFlag("ssh", {
     description: "SSH target as user@host or user@host:/absolute/remote/path",
+    type: "string",
+  });
+  pi.registerFlag("ssh-port", {
+    description: "SSH port (default: 22)",
+    type: "string",
+    default: "22",
+  });
+  pi.registerFlag("p", {
+    description: "Alias for --ssh-port",
     type: "string",
   });
 
@@ -518,14 +545,16 @@ export default function piSshExtension(pi: ExtensionAPI): void {
     if (!flag) return;
 
     try {
-      connection = await resolveSshConnection(flag, localCwd);
+      const rawPort = (pi.getFlag("p") as string | undefined) ?? (pi.getFlag("ssh-port") as string | undefined);
+      const port = parseSshPort(rawPort);
+      connection = await resolveSshConnection(flag, localCwd, port);
       persistentShell = new PersistentRemoteShell(connection);
-      const enabledMessage = `pi-ssh enabled: ${connection.remote}:${connection.remoteCwd}`;
+      const enabledMessage = `pi-ssh enabled: ${connection.remote}:${connection.remoteCwd} (port ${connection.port})`;
       console.log(enabledMessage);
       if (ctx.hasUI) {
         ctx.ui.setStatus(
           "pi-ssh",
-          ctx.ui.theme.fg("accent", `SSH ${connection.remote}:${connection.remoteCwd}`),
+          ctx.ui.theme.fg("accent", `SSH ${connection.remote}:${connection.remoteCwd} (port ${connection.port})`),
         );
         ctx.ui.notify(enabledMessage, "info");
       }
@@ -563,7 +592,7 @@ export default function piSshExtension(pi: ExtensionAPI): void {
     if (!conn) return;
 
     const localPrefix = `Current working directory: ${localCwd}`;
-    const remotePrefix = `Current working directory: ${conn.remoteCwd} (via SSH ${conn.remote})`;
+    const remotePrefix = `Current working directory: ${conn.remoteCwd} (via SSH ${conn.remote}, port ${conn.port})`;
 
     if (!event.systemPrompt.includes(localPrefix)) return;
     return {

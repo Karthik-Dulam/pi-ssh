@@ -1,6 +1,6 @@
 {
   "name": "pi-ssh",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "pi extension for local-model plus remote SSH workspace tool execution",
   "type": "module",
   "private": false,
@@ -12,10 +12,13 @@
     "LICENSE"
   ],
   "keywords": [
+    "pi-package",
     "pi",
-    "coding-agent",
+    "pi-coding-agent",
+    "theme",
     "ssh",
-    "extension"
+    "dark-mode",
+    "ghostty"
   ],
   "author": "Helmut Januschka",
   "license": "MIT",

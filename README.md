@@ -19,6 +19,7 @@ This is useful when:
 ## Features
 
 - `--ssh user@host` or `--ssh user@host:/remote/path`
+- optional port: `--ssh-port 2222` (alias: `-p 2222`, default: `22`)
 - Remote tool delegation for:
   - `read`
   - `write`
@@ -64,18 +65,22 @@ cp /path/to/pi-ssh/index.ts ~/.pi/agent/extensions/pi-ssh.ts
 
 ```bash
 pi --ssh user@my-vm
+# same, explicit default
+pi --ssh user@my-vm --ssh-port 22
 ```
 
 ### Use explicit remote workspace path
 
 ```bash
 pi --ssh user@my-vm:/home/user/chromium/src
+# custom port
+pi --ssh user@my-vm:/home/user/chromium/src -p 2222
 ```
 
 You should see a status line similar to:
 
 ```text
-SSH user@my-vm:/home/user/chromium/src
+SSH user@my-vm:/home/user/chromium/src (port 22)
 ```
 
 ## Typical workflow
@@ -112,7 +117,7 @@ ssh user@host 'bash -lc "which bash cat test mkdir pwd"'
 
 ### Slow tool calls
 
-Each operation opens an SSH process in this MVP. This is simple and robust, but adds overhead. Connection reuse can be added in a future version.
+`bash`/`!` commands use one persistent SSH session. `read`/`write`/`edit` still open per-operation SSH calls for now.
 
 ## Development
 
