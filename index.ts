@@ -93,6 +93,19 @@ function parseDelimitedShellOutput(
   return { output, exitCode };
 }
 
+class CommandQueue {
+  private tail: Promise<void> = Promise.resolve();
+
+  enqueue<T>(task: () => Promise<T>): Promise<T> {
+    const run = this.tail.then(task, task);
+    this.tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+}
+
 function mapLocalPathToRemote(path: string, conn: SshConnection): string {
   if (path === conn.localCwd) return conn.remoteCwd;
   if (path.startsWith(`${conn.localCwd}/`)) {
@@ -235,7 +248,6 @@ class PersistentRemoteShell {
   private connection: SshConnection;
   private child: ChildProcessWithoutNullStreams | null = null;
   private running: RunningCommand | null = null;
-  private queueTail: Promise<void> = Promise.resolve();
   private disposed = false;
 
   constructor(connection: SshConnection) {
@@ -255,12 +267,7 @@ class PersistentRemoteShell {
   }
 
   exec(command: string, cwd: string, options: { onData: (data: Buffer) => void; signal?: AbortSignal; timeout?: number }): Promise<{ exitCode: number | null }> {
-    const run = this.queueTail.then(() => this.execOne(command, cwd, options));
-    this.queueTail = run.then(
-      () => undefined,
-      () => undefined,
-    );
-    return run;
+    return this.execOne(command, cwd, options);
   }
 
   private async ensureStarted(): Promise<void> {
@@ -382,14 +389,9 @@ class PersistentRemoteShell {
 
     const wrappedCommand = [
       `printf '${startMarker}\\n'`,
-      `if cd -- ${shellQuote(remoteCwd)}; then`,
-      `  { ${command}; }`,
-      "  __pi_ec=$?",
-      "else",
-      "  __pi_ec=$?",
-      "fi",
+      `if cd -- ${shellQuote(remoteCwd)}; then { ${command}; }; __pi_ec=$?; else __pi_ec=$?; fi`,
       `printf '${endMarker}:%s\\n' \"$__pi_ec\"`,
-    ].join("\n");
+    ].join("; ");
 
     return new Promise((resolve, reject) => {
       const running: RunningCommand = {
@@ -434,86 +436,142 @@ class PersistentRemoteShell {
 
 const PERSISTENT_WRITE_MAX_BYTES = 256 * 1024;
 
+interface RemoteTransport {
+  dispose(): Promise<void>;
+  exec(
+    command: string,
+    cwd: string,
+    options: { onData: (data: Buffer) => void; signal?: AbortSignal; timeout?: number },
+  ): Promise<{ exitCode: number | null }>;
+  readFile(remotePath: string): Promise<Buffer>;
+  ensureReadable(remotePath: string): Promise<void>;
+  ensureReadableWritable(remotePath: string): Promise<void>;
+  detectImageMimeType(remotePath: string): Promise<string | null>;
+  mkdir(remoteDir: string): Promise<void>;
+  writeFile(remotePath: string, content: Buffer): Promise<void>;
+}
+
 function remoteDirname(path: string): string {
   const slashIndex = path.lastIndexOf("/");
   if (slashIndex <= 0) return "/";
   return path.slice(0, slashIndex);
 }
 
-async function execThroughPersistentShell(
-  shell: PersistentRemoteShell,
-  conn: SshConnection,
-  command: string,
-  timeout?: number,
-): Promise<{ exitCode: number | null; output: Buffer }> {
-  const outputChunks: Buffer[] = [];
-  const result = await shell.exec(command, conn.localCwd, {
-    timeout,
-    onData: (data) => {
-      outputChunks.push(data);
-    },
-  });
-  return {
-    exitCode: result.exitCode,
-    output: Buffer.concat(outputChunks),
-  };
+class SshTransport implements RemoteTransport {
+  private connection: SshConnection;
+  private shell: PersistentRemoteShell;
+  private queue = new CommandQueue();
+
+  constructor(connection: SshConnection) {
+    this.connection = connection;
+    this.shell = new PersistentRemoteShell(connection);
+  }
+
+  async dispose(): Promise<void> {
+    await this.shell.dispose();
+  }
+
+  exec(
+    command: string,
+    cwd: string,
+    options: { onData: (data: Buffer) => void; signal?: AbortSignal; timeout?: number },
+  ): Promise<{ exitCode: number | null }> {
+    return this.queue.enqueue(() => this.shell.exec(command, cwd, options));
+  }
+
+  async readFile(remotePath: string): Promise<Buffer> {
+    return this.runChecked(`cat -- ${shellQuote(remotePath)}`);
+  }
+
+  async ensureReadable(remotePath: string): Promise<void> {
+    await this.runChecked(`test -r ${shellQuote(remotePath)}`);
+  }
+
+  async ensureReadableWritable(remotePath: string): Promise<void> {
+    await this.runChecked(`test -r ${shellQuote(remotePath)} && test -w ${shellQuote(remotePath)}`);
+  }
+
+  async detectImageMimeType(remotePath: string): Promise<string | null> {
+    const result = await this.capture(`file --mime-type -b -- ${shellQuote(remotePath)} 2>/dev/null || true`);
+    const mime = result.output.toString("utf-8").trim();
+    if (["image/jpeg", "image/png", "image/gif", "image/webp"].includes(mime)) {
+      return mime;
+    }
+    return null;
+  }
+
+  async mkdir(remoteDir: string): Promise<void> {
+    await this.runChecked(`mkdir -p -- ${shellQuote(remoteDir)}`);
+  }
+
+  async writeFile(remotePath: string, content: Buffer): Promise<void> {
+    if (content.length <= PERSISTENT_WRITE_MAX_BYTES) {
+      const remoteDir = remoteDirname(remotePath);
+      const encodedContent = content.toString("base64");
+      const command = [
+        `mkdir -p -- ${shellQuote(remoteDir)}`,
+        `printf '%s' ${shellQuote(encodedContent)} | base64 -d > ${shellQuote(remotePath)}`,
+      ].join(" && ");
+
+      try {
+        await this.runChecked(command);
+        return;
+      } catch {
+        // fall through to one-shot streaming fallback
+      }
+    }
+
+    await this.queue.enqueue(async () => {
+      await sshExec(this.connection.remote, this.connection.port, `cat > ${shellQuote(remotePath)}`, {
+        stdin: content,
+      });
+    });
+  }
+
+  private async capture(
+    command: string,
+    options: { timeout?: number; signal?: AbortSignal } = {},
+  ): Promise<{ exitCode: number | null; output: Buffer }> {
+    return this.queue.enqueue(async () => {
+      const outputChunks: Buffer[] = [];
+      const result = await this.shell.exec(command, this.connection.localCwd, {
+        timeout: options.timeout,
+        signal: options.signal,
+        onData: (data) => {
+          outputChunks.push(data);
+        },
+      });
+      return {
+        exitCode: result.exitCode,
+        output: Buffer.concat(outputChunks),
+      };
+    });
+  }
+
+  private async runChecked(command: string, timeout?: number): Promise<Buffer> {
+    const result = await this.capture(command, { timeout });
+    if (result.exitCode !== 0) {
+      const stderr = result.output.toString("utf-8").trim();
+      throw new Error(stderr || `SSH command failed with exit code ${result.exitCode}`);
+    }
+    return result.output;
+  }
 }
 
-function createRemoteReadOps(conn: SshConnection, shell: PersistentRemoteShell | null): ReadOperations {
+function createRemoteReadOps(conn: SshConnection, transport: RemoteTransport): ReadOperations {
   return {
     readFile: async (absolutePath) => {
       const remotePath = mapLocalPathToRemote(absolutePath, conn);
-
-      if (shell) {
-        const result = await execThroughPersistentShell(shell, conn, `cat -- ${shellQuote(remotePath)}`);
-        if (result.exitCode !== 0) {
-          const stderr = result.output.toString("utf-8").trim();
-          throw new Error(stderr || `SSH command failed with exit code ${result.exitCode}`);
-        }
-        return result.output;
-      }
-
-      return sshExec(conn.remote, conn.port, `cat -- ${shellQuote(remotePath)}`);
+      return transport.readFile(remotePath);
     },
     access: async (absolutePath) => {
       const remotePath = mapLocalPathToRemote(absolutePath, conn);
-
-      if (shell) {
-        const result = await execThroughPersistentShell(shell, conn, `test -r ${shellQuote(remotePath)}`);
-        if (result.exitCode !== 0) {
-          const stderr = result.output.toString("utf-8").trim();
-          throw new Error(stderr || `SSH command failed with exit code ${result.exitCode}`);
-        }
-        return;
-      }
-
-      await sshExec(conn.remote, conn.port, `test -r ${shellQuote(remotePath)}`);
+      await transport.ensureReadable(remotePath);
     },
     detectImageMimeType: async (absolutePath) => {
       const remotePath = mapLocalPathToRemote(absolutePath, conn);
       try {
-        let output: Buffer;
-
-        if (shell) {
-          const result = await execThroughPersistentShell(
-            shell,
-            conn,
-            `file --mime-type -b -- ${shellQuote(remotePath)} 2>/dev/null || true`,
-          );
-          output = result.output;
-        } else {
-          output = await sshExec(
-            conn.remote,
-            conn.port,
-            `file --mime-type -b -- ${shellQuote(remotePath)} 2>/dev/null || true`,
-          );
-        }
-
-        const mime = output.toString("utf-8").trim();
-        if (["image/jpeg", "image/png", "image/gif", "image/webp"].includes(mime)) {
-          return mime;
-        }
-        return null;
+        return await transport.detectImageMimeType(remotePath);
       } catch {
         return null;
       }
@@ -521,79 +579,37 @@ function createRemoteReadOps(conn: SshConnection, shell: PersistentRemoteShell |
   };
 }
 
-function createRemoteWriteOps(conn: SshConnection, shell: PersistentRemoteShell | null): WriteOperations {
+function createRemoteWriteOps(conn: SshConnection, transport: RemoteTransport): WriteOperations {
   return {
     mkdir: async (absoluteDir) => {
       const remoteDir = mapLocalPathToRemote(absoluteDir, conn);
-
-      if (shell) {
-        const result = await execThroughPersistentShell(shell, conn, `mkdir -p -- ${shellQuote(remoteDir)}`);
-        if (result.exitCode !== 0) {
-          const stderr = result.output.toString("utf-8").trim();
-          throw new Error(stderr || `SSH command failed with exit code ${result.exitCode}`);
-        }
-        return;
-      }
-
-      await sshExec(conn.remote, conn.port, `mkdir -p -- ${shellQuote(remoteDir)}`);
+      await transport.mkdir(remoteDir);
     },
     writeFile: async (absolutePath, content) => {
       const remotePath = mapLocalPathToRemote(absolutePath, conn);
-      const contentBuffer = Buffer.from(content, "utf-8");
-
-      if (shell && contentBuffer.length <= PERSISTENT_WRITE_MAX_BYTES) {
-        const remoteDir = remoteDirname(remotePath);
-        const encodedContent = contentBuffer.toString("base64");
-        const command = [
-          `mkdir -p -- ${shellQuote(remoteDir)}`,
-          `printf '%s' ${shellQuote(encodedContent)} | base64 -d > ${shellQuote(remotePath)}`,
-        ].join(" && ");
-
-        const result = await execThroughPersistentShell(shell, conn, command);
-        if (result.exitCode === 0) {
-          return;
-        }
-      }
-
-      await sshExec(conn.remote, conn.port, `cat > ${shellQuote(remotePath)}`, {
-        stdin: contentBuffer,
-      });
+      await transport.writeFile(remotePath, Buffer.from(content, "utf-8"));
     },
   };
 }
 
-function createRemoteEditOps(conn: SshConnection, shell: PersistentRemoteShell | null): EditOperations {
-  const readOps = createRemoteReadOps(conn, shell);
-  const writeOps = createRemoteWriteOps(conn, shell);
+function createRemoteEditOps(conn: SshConnection, transport: RemoteTransport): EditOperations {
+  const readOps = createRemoteReadOps(conn, transport);
+  const writeOps = createRemoteWriteOps(conn, transport);
 
   return {
     readFile: readOps.readFile,
     writeFile: writeOps.writeFile,
     access: async (absolutePath) => {
       const remotePath = mapLocalPathToRemote(absolutePath, conn);
-
-      if (shell) {
-        const result = await execThroughPersistentShell(
-          shell,
-          conn,
-          `test -r ${shellQuote(remotePath)} && test -w ${shellQuote(remotePath)}`,
-        );
-        if (result.exitCode !== 0) {
-          const stderr = result.output.toString("utf-8").trim();
-          throw new Error(stderr || `SSH command failed with exit code ${result.exitCode}`);
-        }
-        return;
-      }
-
-      await sshExec(conn.remote, conn.port, `test -r ${shellQuote(remotePath)} && test -w ${shellQuote(remotePath)}`);
+      await transport.ensureReadableWritable(remotePath);
     },
   };
 }
 
-function createRemoteBashOps(shell: PersistentRemoteShell): BashOperations {
+function createRemoteBashOps(transport: RemoteTransport): BashOperations {
   return {
     exec: (command, cwd, { onData, signal, timeout }) => {
-      return shell.exec(command, cwd, { onData, signal, timeout });
+      return transport.exec(command, cwd, { onData, signal, timeout });
     },
   };
 }
@@ -660,7 +676,7 @@ export default function piSshExtension(pi: ExtensionAPI): void {
   const localBash = createBashTool(localCwd);
 
   let connection: SshConnection | null = null;
-  let persistentShell: PersistentRemoteShell | null = null;
+  let transport: SshTransport | null = null;
 
   const getConnection = () => connection;
 
@@ -671,7 +687,10 @@ export default function piSshExtension(pi: ExtensionAPI): void {
       if (!conn) {
         return localRead.execute(id, params, signal, onUpdate);
       }
-      const tool = createReadTool(localCwd, { operations: createRemoteReadOps(conn, persistentShell) });
+      if (!transport) {
+        return localRead.execute(id, params, signal, onUpdate);
+      }
+      const tool = createReadTool(localCwd, { operations: createRemoteReadOps(conn, transport) });
       return tool.execute(id, params, signal, onUpdate);
     },
   });
@@ -683,7 +702,10 @@ export default function piSshExtension(pi: ExtensionAPI): void {
       if (!conn) {
         return localWrite.execute(id, params, signal, onUpdate);
       }
-      const tool = createWriteTool(localCwd, { operations: createRemoteWriteOps(conn, persistentShell) });
+      if (!transport) {
+        return localWrite.execute(id, params, signal, onUpdate);
+      }
+      const tool = createWriteTool(localCwd, { operations: createRemoteWriteOps(conn, transport) });
       return tool.execute(id, params, signal, onUpdate);
     },
   });
@@ -695,7 +717,10 @@ export default function piSshExtension(pi: ExtensionAPI): void {
       if (!conn) {
         return localEdit.execute(id, params, signal, onUpdate);
       }
-      const tool = createEditTool(localCwd, { operations: createRemoteEditOps(conn, persistentShell) });
+      if (!transport) {
+        return localEdit.execute(id, params, signal, onUpdate);
+      }
+      const tool = createEditTool(localCwd, { operations: createRemoteEditOps(conn, transport) });
       return tool.execute(id, params, signal, onUpdate);
     },
   });
@@ -703,11 +728,10 @@ export default function piSshExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     ...localBash,
     async execute(id, params, signal, onUpdate) {
-      const shell = persistentShell;
-      if (!shell) {
+      if (!transport) {
         return localBash.execute(id, params, signal, onUpdate);
       }
-      const tool = createBashTool(localCwd, { operations: createRemoteBashOps(shell) });
+      const tool = createBashTool(localCwd, { operations: createRemoteBashOps(transport) });
       return tool.execute(id, params, signal, onUpdate);
     },
   });
@@ -720,7 +744,7 @@ export default function piSshExtension(pi: ExtensionAPI): void {
       const rawPort = (pi.getFlag("p") as string | undefined) ?? (pi.getFlag("ssh-port") as string | undefined);
       const port = parseSshPort(rawPort);
       connection = await resolveSshConnection(flag, localCwd, localHome, port);
-      persistentShell = new PersistentRemoteShell(connection);
+      transport = new SshTransport(connection);
       const enabledMessage = `pi-ssh enabled: ${connection.remote}:${connection.remoteCwd} (port ${connection.port})`;
       console.log(enabledMessage);
       if (ctx.hasUI) {
@@ -733,9 +757,9 @@ export default function piSshExtension(pi: ExtensionAPI): void {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       connection = null;
-      if (persistentShell) {
-        await persistentShell.dispose();
-        persistentShell = null;
+      if (transport) {
+        await transport.dispose();
+        transport = null;
       }
       console.error(`pi-ssh failed to connect: ${message}`);
       if (ctx.hasUI) {
@@ -747,16 +771,15 @@ export default function piSshExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", async () => {
-    if (persistentShell) {
-      await persistentShell.dispose();
-      persistentShell = null;
+    if (transport) {
+      await transport.dispose();
+      transport = null;
     }
   });
 
   pi.on("user_bash", () => {
-    const shell = persistentShell;
-    if (!shell) return;
-    return { operations: createRemoteBashOps(shell) };
+    if (!transport) return;
+    return { operations: createRemoteBashOps(transport) };
   });
 
   pi.on("before_agent_start", async (event) => {
