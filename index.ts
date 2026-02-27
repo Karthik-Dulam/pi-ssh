@@ -244,11 +244,21 @@ async function sshExec(remote: string, port: number, remoteCommand: string, opti
   return result.stdout;
 }
 
+// Default timeout (5 minutes) prevents a single hung command from blocking
+// the entire SSH command queue forever.
+const DEFAULT_EXEC_TIMEOUT_SECONDS = 300;
+
 class PersistentRemoteShell {
   private connection: SshConnection;
   private child: ChildProcessWithoutNullStreams | null = null;
   private running: RunningCommand | null = null;
   private disposed = false;
+  // Incremental streaming state: tracks how many bytes of the normalized
+  // (post-start-marker) output have already been sent via onData.
+  private streamedBytes = 0;
+  private seenStartMarker = false;
+  // Position in the raw stdout text right after the start marker line.
+  private startMarkerEnd = 0;
 
   constructor(connection: SshConnection) {
     this.connection = connection;
@@ -302,7 +312,8 @@ class PersistentRemoteShell {
 
     this.child = child;
     this.child.stdin.write(
-      "stty -echo 2>/dev/null || true; unset PROMPT_COMMAND 2>/dev/null || true; PS1=''; PROMPT=''; RPROMPT=''; " +
+      "stty -echo 2>/dev/null || true; unset PROMPT_COMMAND 2>/dev/null || true; PS1=''; PS2=''; PROMPT=''; RPROMPT=''; " +
+        "export PAGER=cat; export GIT_PAGER=cat; export GIT_TERMINAL_PROMPT=0; " +
         "if [ -n \"${ZSH_VERSION-}\" ]; then precmd_functions=(); preexec_functions=(); chpwd_functions=(); unset zle_bracketed_paste 2>/dev/null || true; fi; " +
         "if [ -n \"${BASH_VERSION-}\" ]; then bind 'set enable-bracketed-paste off' 2>/dev/null || true; fi\n",
     );
@@ -313,6 +324,7 @@ class PersistentRemoteShell {
     const running = this.running;
     if (!running) return;
     running.stdoutChunks.push(chunk);
+    this.streamIncremental();
     this.tryCompleteRunning();
   }
 
@@ -322,19 +334,101 @@ class PersistentRemoteShell {
     running.stderrChunks.push(chunk);
   }
 
+  /**
+   * Normalize raw PTY output the same way parseDelimitedShellOutput does:
+   * replace \r\n with \n. Bare \r is left intact so byte counts match
+   * the parsed output exactly.
+   */
+  private normalize(text: string): string {
+    return text.replace(/\r\n/g, "\n");
+  }
+
+  /**
+   * Stream output incrementally to onData as it arrives, rather than
+   * waiting for the command to complete. This enables live progress
+   * in the TUI (tool_execution_update events).
+   *
+   * Works on normalized text so the bytes sent match parseDelimitedShellOutput
+   * output exactly, allowing correct "remaining" calculation at completion.
+   */
+  private streamIncremental(): void {
+    const running = this.running;
+    if (!running) return;
+
+    const rawText = Buffer.concat(running.stdoutChunks).toString("utf-8");
+    const text = this.normalize(rawText);
+
+    // Wait until we've seen the start marker before streaming anything
+    if (!this.seenStartMarker) {
+      const startRegex = new RegExp(`(^|\\n)${escapeRegex(running.startMarker)}\\n`);
+      const startMatch = startRegex.exec(text);
+      if (!startMatch) return;
+      this.seenStartMarker = true;
+      this.startMarkerEnd = startMatch.index + startMatch[0].length;
+      this.streamedBytes = 0;
+    }
+
+    // Extract the output region: everything after the start marker
+    const outputSoFar = text.slice(this.startMarkerEnd);
+
+    // Hold back the last 1-2 lines to avoid streaming partial end markers.
+    // The end marker looks like: __PI_SSH_DONE_<id>__:<exitcode>
+    // Find the last newline that's safe to stream up to.
+    const endMarkerPrefix = "__PI_SSH_DONE_";
+    let safeLen = outputSoFar.length;
+
+    // Walk back from the end to find lines that might be (partial) end markers
+    const lastNl = outputSoFar.lastIndexOf("\n");
+    if (lastNl >= 0) {
+      const tailLine = outputSoFar.slice(lastNl + 1);
+      if (tailLine.length === 0 || tailLine.includes(endMarkerPrefix) || endMarkerPrefix.startsWith(tailLine.trimEnd())) {
+        // The incomplete last line might be a marker; hold it back
+        safeLen = lastNl + 1;
+      }
+      // Also check the last complete line
+      if (safeLen === lastNl + 1) {
+        const prevNl = outputSoFar.lastIndexOf("\n", lastNl - 1);
+        const lastCompleteLine = outputSoFar.slice(prevNl + 1, lastNl);
+        if (lastCompleteLine.includes(endMarkerPrefix)) {
+          safeLen = Math.max(0, prevNl + 1);
+        }
+      }
+    } else {
+      // No newline at all yet — could be a partial marker, hold everything back
+      if (outputSoFar.includes(endMarkerPrefix) || endMarkerPrefix.startsWith(outputSoFar.trimEnd())) {
+        safeLen = 0;
+      }
+    }
+
+    if (safeLen > this.streamedBytes) {
+      const newData = outputSoFar.slice(this.streamedBytes, safeLen);
+      if (newData.length > 0) {
+        running.onData(Buffer.from(newData, "utf-8"));
+        this.streamedBytes = safeLen;
+      }
+    }
+  }
+
   private tryCompleteRunning(): void {
     const running = this.running;
     if (!running) return;
 
-    const stdoutText = Buffer.concat(running.stdoutChunks).toString("utf-8");
-    const parsed = parseDelimitedShellOutput(stdoutText, running.startMarker, running.endMarker);
+    const rawText = Buffer.concat(running.stdoutChunks).toString("utf-8");
+    const parsed = parseDelimitedShellOutput(rawText, running.startMarker, running.endMarker);
     if (!parsed) return;
 
-    const cleanStdout = Buffer.from(parsed.output, "utf-8");
-    const cleanStderr = Buffer.concat(running.stderrChunks);
-    const merged = Buffer.concat([cleanStdout, cleanStderr]);
-    if (merged.length > 0) {
-      running.onData(merged);
+    // parsed.output is the normalized output between markers.
+    // Send any bytes we haven't streamed yet (the held-back tail).
+    const fullOutput = parsed.output;
+    if (this.streamedBytes < fullOutput.length) {
+      const remaining = fullOutput.slice(this.streamedBytes);
+      running.onData(Buffer.from(remaining, "utf-8"));
+    }
+
+    // Also send stderr (merged at the end, matching original behavior)
+    const stderr = Buffer.concat(running.stderrChunks);
+    if (stderr.length > 0) {
+      running.onData(stderr);
     }
 
     const exitCode = parsed.exitCode;
@@ -387,17 +481,30 @@ class PersistentRemoteShell {
     const endMarker = `__PI_SSH_DONE_${unique}__`;
     const remoteCwd = mapLocalPathToRemote(cwd, this.connection);
 
+    // Redirect stdin from /dev/null so commands that accidentally read from
+    // stdin (e.g., bare `wc`, `read`, `cat` without args) get EOF immediately
+    // instead of blocking forever on the PTY. Shell pipelines still work
+    // because the pipe overrides stdin for downstream commands.
     const wrappedCommand = [
       `printf '${startMarker}\\n'`,
-      `if cd -- ${shellQuote(remoteCwd)}; then { ${command}; }; __pi_ec=$?; else __pi_ec=$?; fi`,
-      `printf '${endMarker}:%s\\n' \"$__pi_ec\"`,
+      `if cd -- ${shellQuote(remoteCwd)}; then { ${command}; } </dev/null; __pi_ec=$?; else __pi_ec=$?; fi`,
+      `printf '\\n${endMarker}:%s\\n' \"$__pi_ec\"`,
     ].join("; ");
+
+    // Reset incremental streaming state for the new command
+    this.streamedBytes = 0;
+    this.seenStartMarker = false;
+    this.startMarkerEnd = 0;
+
+    // Apply default timeout if none specified, so a hung command can't
+    // block the queue forever
+    const effectiveTimeout = options.timeout ?? DEFAULT_EXEC_TIMEOUT_SECONDS;
 
     return new Promise((resolve, reject) => {
       const running: RunningCommand = {
         startMarker,
         endMarker,
-        timeout: options.timeout,
+        timeout: effectiveTimeout,
         onData: options.onData,
         signal: options.signal,
         aborted: false,
@@ -408,11 +515,11 @@ class PersistentRemoteShell {
         reject,
       };
 
-      if (options.timeout && options.timeout > 0) {
+      if (effectiveTimeout > 0) {
         running.timeoutHandle = setTimeout(() => {
           running.timedOut = true;
           this.interruptCurrentCommand();
-        }, options.timeout * 1000);
+        }, effectiveTimeout * 1000);
       }
 
       if (options.signal) {
